@@ -2,7 +2,7 @@
 
 Switch your Obsidian Canvas notes from Japanese to English for viewing, while keeping the originals unchanged.
 
-**Status:** Experimental desktop plugin, version **0.2.2**.
+**Status:** Experimental desktop plugin, version **0.2.3**.
 
 **Requires:** Obsidian **1.11.4+** and an OpenAI API key with access to the configured model. Translation sends note text and short context to OpenAI and may incur API charges.
 

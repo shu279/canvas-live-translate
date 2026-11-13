@@ -2,6 +2,14 @@
 
 These entries describe changes and validation performed at the time of each build. See the README for current compatibility reports.
 
+## What changed in v0.2.3
+
+- Bound Notion webview waits so an unresponsive card cannot indefinitely block returning to Japanese. Failed restoration can be retried.
+- Reject expired or cancelled guest requests, and isolate reattached cards from their previous sessions.
+- Continue native cleanup even if one cleanup step fails, and prevent stale transitions from changing the latest toggle state.
+- Avoid rerendering native previews from cleanup observers, preventing repeated cached-DOM insertion from causing a loop.
+- Keep the source, production bundle, and release metadata in sync.
+
 ## What changed in v0.2.2
 
 - **Stable scrolling during lazy loading:** keep the same scroll container and unchanged translated text nodes while updating source content. Appended Markdown no longer replaces the whole English preview with a temporarily shorter Japanese clone, which could clamp the scroll position upwards.

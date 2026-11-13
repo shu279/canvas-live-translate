@@ -31,6 +31,8 @@ export interface NotionWebviewOptions {
   onChange?: () => void;
   onStatus?: (status: NotionAdapterStatus) => void;
   pollIntervalMs?: number;
+  rpcTimeoutMs?: number;
+  restoreTimeoutMs?: number;
 }
 
 interface PendingPatch {
@@ -44,6 +46,7 @@ interface PendingPatch {
 
 interface Slot {
   id: number;
+  session: string;
   element: NotionWebviewElement;
   epoch: number;
   revision: number;
@@ -52,9 +55,18 @@ interface Slot {
   patches: PendingPatch[];
   flushScheduled: boolean;
   touched: boolean;
+  unresponsive: boolean;
+  restoring: Promise<boolean> | null;
+  latestRequestExpiry: number;
 }
 
+const RPC_TIMEOUT_MS = 2000;
+const RESTORE_TIMEOUT_MS = 4500;
 const WEBVIEW_EVENTS = ["dom-ready", "did-navigate", "did-navigate-in-page", "did-stop-loading"];
+
+function timeoutMs(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) ? Math.max(1, Math.min(30000, Math.floor(value))) : fallback;
+}
 
 /** Exact HTTPS hostname allowlist; misleading suffixes and URL credentials do not count. */
 export function isNotionUrl(value: string): boolean {
@@ -94,13 +106,18 @@ export class NotionWebviewController {
   private readonly operationChains = new WeakMap<NotionWebviewElement, Promise<void>>();
   private readonly pendingRestores = new Set<Slot>();
   private readonly timer: ReturnType<typeof setInterval>;
+  private readonly rpcTimeoutMs: number;
+  private readonly restoreTimeoutMs: number;
   private nextId = 0;
   private destroyed = false;
   private collecting: Promise<WebTranslationTarget[]> | null = null;
   private destroying: Promise<NotionRestoreResult> | null = null;
+  private restoringOriginals: Promise<NotionRestoreResult> | null = null;
   private status: NotionAdapterStatus = { found: 0, ready: 0, loading: 0, unsupported: 0, failed: 0, truncated: false, restoreFailed: 0 };
 
   constructor(private readonly root: HTMLElement, private readonly options: NotionWebviewOptions = {}) {
+    this.rpcTimeoutMs = timeoutMs(options.rpcTimeoutMs, RPC_TIMEOUT_MS);
+    this.restoreTimeoutMs = timeoutMs(options.restoreTimeoutMs, RESTORE_TIMEOUT_MS);
     // Guest-page DOM mutations are invisible to a MutationObserver in Obsidian.
     // A light collection poll catches Notion lazy rendering, without sending any
     // text to the API until the host's shared cache/scheduler decides it is needed.
@@ -127,15 +144,16 @@ export class NotionWebviewController {
       const actualUrl = readActualUrl(element);
       if (!isNotionUrl(actualUrl) && !isNotionUrl(advertisedUrl)) continue;
       const slot: Slot = {
-        id: ++this.nextId, element, epoch: 0, revision: -1, url: actualUrl,
+        id: ++this.nextId, session: `${this.session}_${this.nextId}`, element, epoch: 0, revision: -1, url: actualUrl,
         eventHandler: () => {
           slot.epoch++;
           slot.revision = -1;
           slot.url = readActualUrl(element);
+          slot.unresponsive = false;
           this.resolvePatches(slot, false);
           this.options.onChange?.();
         },
-        patches: [], flushScheduled: false, touched: false
+        patches: [], flushScheduled: false, touched: false, unresponsive: false, restoring: null, latestRequestExpiry: 0
       };
       for (const event of WEBVIEW_EVENTS) element.addEventListener(event, slot.eventHandler);
       this.slots.set(element, slot);
@@ -169,13 +187,13 @@ export class NotionWebviewController {
       status.found++;
       if (typeof slot.element.executeJavaScript !== "function") { status.unsupported++; return; }
       if (pageIdentity(url) !== pageIdentity(slot.url)) {
-        slot.url = url; slot.epoch++; slot.revision = -1;
+        slot.url = url; slot.epoch++; slot.revision = -1; slot.unresponsive = false;
         this.resolvePatches(slot, false);
       }
       const epoch = slot.epoch;
       try {
         const result = await this.execute(slot, {
-          action: "collect", session: this.session, expectedUrl: url, limit: 300
+          action: "collect", session: slot.session, expectedUrl: url, limit: 300
         });
         if (this.destroyed || epoch !== slot.epoch || !slot.element.isConnected ||
             pageIdentity(readActualUrl(slot.element)) !== pageIdentity(url)) return;
@@ -189,7 +207,7 @@ export class NotionWebviewController {
           if (!part || typeof part.id !== "string" || !/^\d{1,7}$/.test(part.id) ||
               typeof part.source !== "string" || part.source.length > 20000 ||
               typeof part.context !== "string" || part.context.length > 1000) continue;
-          const isCurrent = (): boolean => !this.destroyed && slot.element.isConnected &&
+          const isCurrent = (): boolean => !this.destroyed && !slot.unresponsive && slot.element.isConnected &&
             epoch === slot.epoch && revision === slot.revision && isNotionUrl(readActualUrl(slot.element)) &&
             pageIdentity(readActualUrl(slot.element)) === pageIdentity(url);
           targets.push({
@@ -237,7 +255,7 @@ export class NotionWebviewController {
     }
     try {
       const result = await this.execute(slot, {
-        action: "apply", session: this.session, expectedUrl: url, revision: slot.revision,
+        action: "apply", session: slot.session, expectedUrl: url, revision: slot.revision,
         patches: current.map(({ id, source, translated }) => ({ id, source, translated }))
       });
       const valid = !this.destroyed && current.every(patch => patch.epoch === slot.epoch) &&
@@ -261,24 +279,53 @@ export class NotionWebviewController {
   }
 
   /** Serialize guest operations, including those from a removed/reinserted card. */
-  private execute(slot: Slot, request: NotionPageRequest): Promise<unknown> {
+  private execute(slot: Slot, request: NotionPageRequest, timeout = this.rpcTimeoutMs): Promise<unknown> {
+    if (request.action !== "restore" && slot.unresponsive) return Promise.reject(new Error("Notion card is not responding"));
     // Mark as potentially injected before queueing, so removal in the same tick
     // still schedules cleanup AFTER an already-queued collection operation.
     if (request.action === "collect") slot.touched = true;
+    const expiresAt = Date.now() + timeout;
+    if (request.action !== "restore") slot.latestRequestExpiry = Math.max(slot.latestRequestExpiry, expiresAt);
+    const timedRequest: NotionPageRequest = {
+      ...request, expiresAt,
+      ...(request.action === "restore" ? { cancelUntil: slot.latestRequestExpiry } : {})
+    };
+    const epoch = slot.epoch;
     const previous = this.operationChains.get(slot.element) ?? Promise.resolve();
     const execution = previous.then(async () => {
+      if (Date.now() >= expiresAt) throw new Error("Notion card operation timed out");
+      if (request.action !== "restore" && (this.destroyed || slot.unresponsive || epoch !== slot.epoch ||
+          this.slots.get(slot.element) !== slot || !slot.element.isConnected))
+        return { status: "not-ready", revision: 0, parts: [] } satisfies NotionPageResponse;
       const actualUrl = readActualUrl(slot.element);
       if (!isNotionUrl(actualUrl) || pageIdentity(actualUrl) !== pageIdentity(request.expectedUrl))
         return { status: "wrong-page", revision: 0, parts: [] } satisfies NotionPageResponse;
       if (typeof slot.element.executeJavaScript !== "function") throw new Error("Webview execution unavailable");
-      return slot.element.executeJavaScript(buildNotionPageScript(request), false);
+      return slot.element.executeJavaScript(buildNotionPageScript(timedRequest), false);
     });
-    // Failure of an earlier operation must not prevent the queued restoration.
-    this.operationChains.set(slot.element, execution.then(() => undefined, () => undefined));
-    return execution;
+    const bounded = new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (slot.epoch === epoch) slot.unresponsive = true;
+        reject(new Error("Notion card operation timed out"));
+      }, timeout);
+      execution.then(result => { clearTimeout(timer); resolve(result); }, error => { clearTimeout(timer); reject(error); });
+    });
+    // A hung guest call must not block restoration forever. Expiry and guest
+    // cancellation tombstones prevent its late execution from reviving a clone.
+    this.operationChains.set(slot.element, bounded.then(() => undefined, () => undefined));
+    return bounded;
   }
 
-  private async restoreSlot(slot: Slot): Promise<boolean> {
+  private restoreSlot(slot: Slot): Promise<boolean> {
+    if (slot.restoring) return slot.restoring;
+    const work = this.performRestoreSlot(slot);
+    slot.restoring = work;
+    const clear = () => { if (slot.restoring === work) slot.restoring = null; };
+    void work.then(clear, clear);
+    return work;
+  }
+
+  private async performRestoreSlot(slot: Slot): Promise<boolean> {
     if (!slot.touched) {
       // A not-yet-loaded or unsupported card was never injected; it cannot have
       // a translated overlay and must not cause a spurious JA restoration error.
@@ -297,8 +344,8 @@ export class NotionWebviewController {
     }
     try {
       const result = await this.execute(slot, {
-        action: "restore", session: this.session, expectedUrl: url
-      });
+        action: "restore", session: slot.session, expectedUrl: url
+      }, this.restoreTimeoutMs);
       if (isResponse(result) && result.status === "restored") {
         this.pendingRestores.delete(slot);
         return true;
@@ -310,12 +357,17 @@ export class NotionWebviewController {
 
   /** May be called again after destroy() to retry failed guest restoration. */
   async restoreOriginals(): Promise<NotionRestoreResult> {
-    const slots = Array.from(this.pendingRestores);
-    const outcomes = await Promise.all(slots.map(slot => this.restoreSlot(slot)));
-    const result = { restored: outcomes.filter(Boolean).length, failed: outcomes.filter(value => !value).length };
-    this.status.restoreFailed = result.failed;
-    this.options.onStatus?.(this.getStatus());
-    return result;
+    if (this.restoringOriginals) return this.restoringOriginals;
+    this.restoringOriginals = (async () => {
+      const slots = Array.from(this.pendingRestores);
+      const outcomes = await Promise.all(slots.map(slot => this.restoreSlot(slot)));
+      const result = { restored: outcomes.filter(Boolean).length, failed: outcomes.filter(value => !value).length };
+      this.status.restoreFailed = result.failed;
+      this.options.onStatus?.(this.getStatus());
+      return result;
+    })();
+    try { return await this.restoringOriginals; }
+    finally { this.restoringOriginals = null; }
   }
 
   async destroy(): Promise<NotionRestoreResult> {
@@ -325,12 +377,7 @@ export class NotionWebviewController {
     const slots = Array.from(this.slots.values());
     slots.forEach(slot => { this.detachSlot(slot); this.pendingRestores.add(slot); });
     this.slots.clear();
-    // Collection may already have submitted guest initialization. Wait for that
-    // action before cleanup, so a rapid EN -> JA toggle cannot leave a late clone.
-    this.destroying = (async () => {
-      try { await this.collecting; } catch { /* Collection reports failures in status. */ }
-      return this.restoreOriginals();
-    })();
+    this.destroying = this.restoreOriginals();
     return this.destroying;
   }
 }

@@ -50,15 +50,11 @@ function matchesWithin(scope: HTMLElement, selector: string): HTMLElement[] {
   return [...(scope.matches(selector) ? [scope] : []), ...scope.querySelectorAll<HTMLElement>(selector)];
 }
 
-function clean(scope: HTMLElement): Set<HTMLElement> {
-  const cards = new Set<HTMLElement>();
+function clean(scope: HTMLElement): void {
   for (const artifact of matchesWithin(scope, ARTIFACT_SELECTOR)) {
-    const card = artifact.closest<HTMLElement>(".canvas-node");
-    if (card) cards.add(card);
     if (artifact.matches(PRESENTATION_SELECTOR)) artifact.remove();
     else artifact.classList.remove("clt-source-container", "clt-label-source", "clt-text-readonly");
   }
-  return cards;
 }
 
 export function createOriginalCanvasView(root: HTMLElement, canvas?: unknown): OriginalCanvasView {
@@ -67,13 +63,12 @@ export function createOriginalCanvasView(root: HTMLElement, canvas?: unknown): O
   const canRestore = () => active && !root.classList.contains("canvas-live-translate-enabled");
   const Observer = root.ownerDocument.defaultView?.MutationObserver;
 
-  function refreshPreviews(nodes: RecordLike[], affected?: Set<HTMLElement>): void {
+  function refreshPreviews(nodes: RecordLike[]): void {
     const refreshed = new Set<RecordLike>();
     for (const node of nodes) {
       const scopes = nativeScopes(node);
       const editing = () => node.isEditing === true || scopes.some(scope => scope.matches(".is-editing") || scope.closest(".canvas-node.is-editing"));
       if (editing()) continue;
-      if (affected && !scopes.some(scope => Array.from(affected).some(card => scope === card || card.contains(scope) || scope.contains(card)))) continue;
       const child = record(node.child);
       const preview = record(child?.previewMode) ?? child;
       if (!preview || refreshed.has(preview) || typeof preview.rerender !== "function") continue;
@@ -111,17 +106,15 @@ export function createOriginalCanvasView(root: HTMLElement, canvas?: unknown): O
 
   const observer = Observer ? new Observer(records => {
     if (!canRestore()) return;
-    const affected = new Set<HTMLElement>();
-    let changed = false;
     for (const mutation of records) {
       for (const added of mutation.addedNodes) {
         const scope = element(added);
         if (!scope || (!scope.matches(ARTIFACT_SELECTOR) && !scope.querySelector(ARTIFACT_SELECTOR))) continue;
-        changed = true;
-        for (const card of clean(scope)) affected.add(card);
+        clean(scope);
       }
     }
-    if (changed) refreshPreviews(canvasNodes(canvas), affected);
+    // Do not rerender from the observer: a native renderer can reinsert its
+    // cached marked DOM and otherwise trigger an unbounded rerender loop.
   }) : null;
 
   function restore(): void {

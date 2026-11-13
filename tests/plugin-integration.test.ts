@@ -458,3 +458,69 @@ test("switching Canvas tabs restores the old view and translates the new view us
     assert.equal(f.host.state.status!.textContent, "Canvas: EN (inactive)");
   } finally { await f.stop(); }
 });
+
+test("a native cleanup failure still unlocks Canvas and restores web cards", async () => {
+  const f = await fixture();
+  try {
+    await f.command("toggle-canvas-translation");
+    await eventually(() => !!f.root.querySelector(".clt-native-presentation"), "Missing presentation");
+    const session = f.plugin.session;
+    const destroyQueue = session.queue.destroy.bind(session.queue);
+    session.queue.destroy = () => { destroyQueue(); throw new Error("Cleanup failure"); };
+    let restored = 0;
+    session.web = { destroy: async () => { restored++; return { failed: 0, restored: 1 }; } };
+    await f.command("show-original-canvas");
+    assert.equal(restored, 1);
+    assert.equal(f.root.classList.contains("canvas-live-translate-enabled"), false);
+    assert.equal(f.root.querySelector(".clt-native-presentation"), null);
+    assert.match(f.plugin.restoreError, /could not be completely restored/);
+    assert.equal(f.plugin.transitioning, false);
+    await f.command("show-original-canvas");
+    assert.equal(f.plugin.restoreError, "");
+  } finally { await f.stop(); }
+});
+
+test("a hung web restoration releases the transition and allows an explicit retry", { timeout: 4000 }, async () => {
+  const f = await fixture();
+  const originalTimeout = f.dom.window.setTimeout.bind(f.dom.window);
+  // Exercise the production timeout path without waiting eight real seconds.
+  f.dom.window.setTimeout = ((handler: any, delay?: number, ...args: any[]) =>
+    originalTimeout(handler, delay === 8000 ? 20 : delay, ...args)) as typeof f.dom.window.setTimeout;
+  try {
+    await f.command("toggle-canvas-translation");
+    const controller = {
+      destroy: () => new Promise(() => {}),
+      restoreOriginals: async () => ({ failed: 0, restored: 1 })
+    };
+    f.plugin.session.web = controller;
+    await f.command("show-original-canvas");
+    assert.equal(f.plugin.transitioning, false);
+    assert.match(f.plugin.restoreError, /within 8 seconds/);
+    assert.equal(f.root.classList.contains("canvas-live-translate-enabled"), false);
+    await f.command("show-original-canvas");
+    assert.equal(f.plugin.restoreError, "");
+    assert.equal(f.plugin.pendingRestores.size, 0);
+  } finally { await f.stop(); }
+});
+
+test("a failed obsolete transition cannot turn off a newer requested English session", async () => {
+  const f = await fixture();
+  let finish!: (value: { failed: number; restored: number }) => void;
+  let began!: () => void;
+  const started = new Promise<void>(resolve => { began = resolve; });
+  try {
+    await f.command("toggle-canvas-translation");
+    f.plugin.session.web = {
+      destroy: () => { began(); return new Promise(resolve => { finish = resolve; }); },
+      restoreOriginals: async () => ({ failed: 0, restored: 1 })
+    };
+    await f.command("show-original-canvas", false);
+    await started;
+    await f.command("toggle-canvas-translation", false);
+    finish({ failed: 1, restored: 0 });
+    await f.plugin.transitionWork;
+    assert.equal(f.plugin.enabled, true);
+    assert.ok(f.plugin.session);
+    assert.equal(f.plugin.restoreError, "");
+  } finally { finish?.({ failed: 0, restored: 1 }); await f.stop(); }
+});

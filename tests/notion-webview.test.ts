@@ -48,7 +48,7 @@ function createGuest(markup = `
   return { dom, action };
 }
 
-function createHost(guest: JSDOM) {
+function createHost(guest: JSDOM, options: { rpcTimeoutMs?: number; restoreTimeoutMs?: number } = {}) {
   const host = new JSDOM(`<main><div class="canvas-node"><webview src="${URL}"></webview></div></main>`, { url: "https://obsidian.local", runScripts: "outside-only" });
   host.window.eval(`${hostBundle};globalThis.CltHost = CltHost;`);
   const api = (host.window as any).CltHost as {
@@ -59,7 +59,7 @@ function createHost(guest: JSDOM) {
   element.getURL = () => guest.window.location.href;
   const calls: string[] = [];
   element.executeJavaScript = async code => { calls.push(code); return guest.window.eval(code); };
-  const controller = new api.NotionWebviewController(host.window.document.querySelector("main")!, { pollIntervalMs: 60000 });
+  const controller = new api.NotionWebviewController(host.window.document.querySelector("main")!, { pollIntervalMs: 60000, ...options });
   return { host, element, controller, calls, api };
 }
 
@@ -309,7 +309,9 @@ test("overlapping off/on sessions release only their own original-page input loc
   assert.equal(original.hasAttribute("inert"), false);
   assert.equal(dom.window.document.querySelectorAll("[data-clt-notion-presentation]").length, 0);
   original.setAttribute("inert", "original-value");
-  action(); action({ action: "restore" });
+  const freshSession = "clt_third_session_12345";
+  assert.equal(action({ session: freshSession }).status, "ready");
+  action({ action: "restore", session: freshSession });
   assert.equal(original.getAttribute("inert"), "original-value");
   dom.window.close();
 });
@@ -336,4 +338,103 @@ test("detaching before queued collection starts still schedules cleanup after it
     await Promise.all([collecting, restoring]);
     assert.equal(guest.window.document.querySelector("[data-clt-notion-presentation]"), null);
   } finally { await controller.destroy(); host.window.close(); guest.window.close(); }
+});
+
+test("guest rejects expired requests and cancelled sessions even when collection arrives after restore", () => {
+  const { dom, action } = createGuest();
+  let now = 1000;
+  dom.window.Date.now = () => now;
+  try {
+    assert.equal(action({ expiresAt: 999 }).status, "not-ready");
+    assert.equal(dom.window.document.querySelector("[data-clt-notion-presentation]"), null);
+    assert.equal(action({ action: "restore", expiresAt: 1100, cancelUntil: 1300 }).status, "restored");
+    now = 1200;
+    assert.equal(action({ expiresAt: 1300 }).status, "not-ready", "Cancellation must outlive the restore deadline");
+    assert.equal(dom.window.document.querySelector("[data-clt-notion-presentation]"), null);
+    assert.equal(action({ session: "clt_new_session_12345", expiresAt: 1400 }).status, "ready");
+    now = 1301;
+    assert.equal(action({ expiresAt: 1300 }).status, "not-ready", "Expired calls remain invalid after tombstone pruning");
+    assert.equal(dom.window.document.querySelectorAll("[data-clt-notion-presentation]").length, 1);
+  } finally { dom.window.close(); }
+});
+
+test("hung collection times out without repeated calls, and a late execution cannot revive the restored overlay", { timeout: 4000 }, async () => {
+  const { dom: guest } = createGuest();
+  const { host, element, controller, calls } = createHost(guest, { rpcTimeoutMs: 100, restoreTimeoutMs: 500 });
+  const real = element.executeJavaScript!;
+  let lateCode = "";
+  let collectCalls = 0;
+  let finish!: (value: unknown) => void;
+  element.executeJavaScript = code => {
+    if (code.includes('"action":"collect"')) {
+      collectCalls++;
+      lateCode = code;
+      return new Promise(resolve => { finish = resolve; });
+    }
+    return real(code);
+  };
+  try {
+    assert.equal((await controller.collect()).length, 0);
+    assert.equal(controller.getStatus().failed, 1);
+    const savedCode = lateCode;
+    assert.equal((await controller.collect()).length, 0);
+    assert.equal(lateCode, savedCode, "Do not keep issuing requests to an unresponsive card");
+    assert.equal(collectCalls, 1);
+    assert.equal((await controller.destroy()).failed, 0);
+    assert.equal(calls.filter(code => code.includes('"action":"restore"')).length, 1);
+    const late = guest.window.eval(lateCode);
+    finish(late);
+    assert.equal(late.status, "not-ready");
+    assert.equal(guest.window.document.querySelector("[data-clt-notion-presentation]"), null);
+    assert.equal(guest.window.document.querySelector(".notion-scroller")!.hasAttribute("inert"), false);
+  } finally { await controller.destroy(); host.window.close(); guest.window.close(); }
+});
+
+test("a hung translation patch releases its caller and cannot apply after original restoration", { timeout: 4000 }, async () => {
+  const { dom: guest } = createGuest();
+  const { host, element, controller } = createHost(guest, { rpcTimeoutMs: 100, restoreTimeoutMs: 500 });
+  const real = element.executeJavaScript!;
+  let lateCode = "";
+  let finish!: (value: unknown) => void;
+  try {
+    const targets = await controller.collect();
+    element.executeJavaScript = code => {
+      if (!code.includes('"action":"apply"')) return real(code);
+      lateCode = code;
+      return new Promise(resolve => { finish = resolve; });
+    };
+    assert.equal(await targets[0].apply("Late English"), false);
+    assert.equal(targets[0].isCurrent(), false);
+    assert.equal((await controller.destroy()).failed, 0);
+    const late = guest.window.eval(lateCode);
+    finish(late);
+    assert.equal(late.status, "not-ready");
+    assert.equal(guest.window.document.querySelector("[data-clt-notion-presentation]"), null);
+  } finally { await controller.destroy(); host.window.close(); guest.window.close(); }
+});
+
+test("hung restoration reports failure and concurrent explicit retries share one guest call", { timeout: 4000 }, async () => {
+  const { dom: guest } = createGuest();
+  const { host, element, controller } = createHost(guest, { rpcTimeoutMs: 100, restoreTimeoutMs: 150 });
+  const real = element.executeJavaScript!;
+  let release!: () => void;
+  try {
+    await controller.collect();
+    element.executeJavaScript = () => new Promise(() => {});
+    assert.equal((await controller.destroy()).failed, 1);
+    assert.equal(controller.getStatus().restoreFailed, 1);
+    assert.ok(guest.window.document.querySelector("[data-clt-notion-presentation]"));
+    let retryCalls = 0;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    element.executeJavaScript = async code => { retryCalls++; await gate; return real(code); };
+    const first = controller.restoreOriginals();
+    const second = controller.restoreOriginals();
+    release();
+    const results = await Promise.all([first, second]);
+    assert.equal(retryCalls, 1);
+    assert.ok(results.every(result => result.failed === 0 && result.restored === 1));
+    assert.equal(controller.getStatus().restoreFailed, 0);
+    assert.equal(guest.window.document.querySelector("[data-clt-notion-presentation]"), null);
+    assert.equal(guest.window.document.querySelector(".notion-scroller")!.hasAttribute("inert"), false);
+  } finally { release?.(); await controller.destroy(); host.window.close(); guest.window.close(); }
 });

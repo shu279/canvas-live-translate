@@ -1,7 +1,7 @@
 {
   "id": "canvas-live-translate",
   "name": "Canvas Live Translate",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "minAppVersion": "1.11.4",
   "description": "Read-only, scrollable translations in native Canvas and supported Notion web cards, without editing source notes.",
   "author": "Shu",

@@ -6,6 +6,8 @@ export interface NotionPageRequest {
   revision?: number;
   patches?: Array<{ id: string; source: string; translated: string }>;
   limit?: number;
+  expiresAt?: number;
+  cancelUntil?: number;
 }
 
 export interface NotionPagePart {
@@ -63,12 +65,24 @@ export function notionPageAction(request: NotionPageRequest): NotionPageResponse
 
   const stateKey = `__canvasLiveTranslateNotion_${request.session}`;
   const globals = window as unknown as Record<string, unknown>;
+  // A timed-out Electron call can still execute later. Keep a cancellation
+  // tombstone until every request from this session has expired.
+  const cancelledKey = "__canvasLiveTranslateNotionCancelled";
+  let cancelled = globals[cancelledKey] as Map<string, number> | undefined;
+  if (!(cancelled instanceof Map)) globals[cancelledKey] = cancelled = new Map();
+  const now = Date.now();
+  for (const [session, expiry] of cancelled) if (expiry < now) cancelled.delete(session);
   let state = globals[stateKey] as State | undefined;
   if (request.action === "restore") {
+    const until = request.expiresAt === undefined ? Infinity
+      : Math.max(now, request.expiresAt, request.cancelUntil ?? 0);
+    cancelled.set(request.session, Math.max(cancelled.get(request.session) ?? 0, until));
     state?.dispose();
     delete globals[stateKey];
     return response("restored");
   }
+  if (cancelled.has(request.session) || (request.expiresAt !== undefined &&
+      (!Number.isFinite(request.expiresAt) || request.expiresAt <= now))) return response("not-ready");
 
   const japanese = /[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f]/u;
   const protectedSelector = [

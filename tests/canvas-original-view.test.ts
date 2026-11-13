@@ -142,3 +142,29 @@ test("the JA cleanup observer does not remove overlays from a new English sessio
     assert.ok(later.querySelector(".clt-native-presentation"), "Destroyed controller must no longer mutate the DOM");
   } finally { controller.destroy(); f.dom.window.close(); }
 });
+
+test("a renderer that reinserts marked cached DOM cannot cause a cleanup rerender loop", async () => {
+  const f = fixture();
+  let rerenders = 0;
+  const previewMode = {
+    containerEl: f.preview,
+    rerender() {
+      rerenders++;
+      // Bound the old behavior so the regression test fails instead of hanging.
+      if (rerenders < 5) {
+        const stale = f.dom.window.document.createElement("div");
+        stale.className = "clt-native-presentation";
+        f.preview.append(stale);
+      }
+    }
+  };
+  const controller = createOriginalCanvasView(f.root, { nodes: [{ nodeEl: f.card, child: { previewMode } }] });
+  try {
+    await tick();
+    assert.equal(rerenders, 1);
+    assert.equal(f.root.querySelector(".clt-native-presentation"), null);
+    controller.restore();
+    await tick();
+    assert.equal(rerenders, 2, "An explicit restore may still refresh the native preview once");
+  } finally { controller.destroy(); f.dom.window.close(); }
+});

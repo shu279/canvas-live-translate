@@ -46,6 +46,7 @@ const DEFAULT_SETTINGS: TranslateSettings = {
   concurrency: 3, translateNotion: true
 };
 const MAX_CACHE_ENTRIES = 15000;
+const RESTORATION_TIMEOUT_MS = 8000;
 
 export default class CanvasLiveTranslate extends Plugin {
   settings: TranslateSettings = { ...DEFAULT_SETTINGS };
@@ -158,11 +159,11 @@ export default class CanvasLiveTranslate extends Plugin {
       const previous = this.session; this.session = null;
       try {
         if (previous) await this.closeSession(previous);
-        for (const controller of this.pendingRestores) {
-          const restored = await controller.restoreOriginals();
+        await Promise.all(Array.from(this.pendingRestores, async controller => {
+          const restored = await this.awaitRestoration(controller.restoreOriginals());
           if (restored.failed) throw new Error("A Notion card could not restore its original view.");
           this.pendingRestores.delete(controller);
-        }
+        }));
         this.restoreError = "";
         if (ticket !== this.transitionId || this.shuttingDown) return;
         const leaf = this.getActiveCanvasLeaf();
@@ -174,9 +175,11 @@ export default class CanvasLiveTranslate extends Plugin {
         }
         if (leaf) this.session = this.createSession(leaf);
       } catch (error) {
-        this.enabled = false;
-        this.restoreError = error instanceof Error ? error.message : "A translated web card could not be restored.";
-        new Notice(`${this.restoreError} Reload the affected web card or restart Obsidian.`, 10000);
+        if (ticket === this.transitionId) {
+          this.enabled = false;
+          this.restoreError = error instanceof Error ? error.message : "The original Canvas view could not be restored.";
+          new Notice(`${this.restoreError} Run Show original Japanese again, or reopen the affected card.`, 10000);
+        }
       } finally {
         if (ticket === this.transitionId) this.transitioning = false;
         this.refreshStatus();
@@ -247,24 +250,42 @@ export default class CanvasLiveTranslate extends Plugin {
     return !this.shuttingDown && this.enabled && !session.destroyed && this.session === session;
   }
   private async closeSession(session: CanvasSession): Promise<void> {
-    session.destroyed = true; session.observer.disconnect();
+    session.destroyed = true;
+    const web = session.web;
+    if (web) this.pendingRestores.add(web);
+    const webRestoration = web ? this.awaitRestoration(Promise.resolve().then(() => web.destroy())) : null;
+    let nativeFailed = false;
+    const attempt = (cleanup: () => void): void => {
+      try { cleanup(); } catch { nativeFailed = true; }
+    };
+    attempt(() => session.observer.disconnect());
     if (session.timer !== null) window.clearTimeout(session.timer);
-    session.root.removeEventListener("scroll", session.onScroll, true);
-    session.root.removeEventListener("wheel", session.onScroll);
-    session.queue.destroy();
+    session.timer = null;
+    attempt(() => session.root.removeEventListener("scroll", session.onScroll, true));
+    attempt(() => session.root.removeEventListener("wheel", session.onScroll));
+    attempt(() => session.queue.destroy());
     // Native preview renderers can retain/reparent descendants of a clone.
     // Restore our exact tracked writes before releasing those DOM references.
-    for (const [node, target] of session.nativeTargets) this.restoreNativeTarget(node, target);
-    session.presentation.destroy(); session.interaction.destroy();
-    session.root.classList.remove("canvas-live-translate-enabled");
+    for (const [node, target] of session.nativeTargets) attempt(() => this.restoreNativeTarget(node, target));
+    attempt(() => session.presentation.destroy());
+    attempt(() => session.interaction.destroy());
+    attempt(() => session.root.classList.remove("canvas-live-translate-enabled"));
     session.nativeTargets.clear(); session.webTargets.clear(); session.keyPromises.clear();
-    this.restoreNativeCanvas(session.view);
-    if (session.web) {
-      this.pendingRestores.add(session.web);
-      const result = await session.web.destroy();
+    attempt(() => this.restoreNativeCanvas(session.view));
+    if (webRestoration && web) {
+      const result = await webRestoration;
       if (result.failed) throw new Error("A Notion card could not restore its original view.");
-      this.pendingRestores.delete(session.web);
+      this.pendingRestores.delete(web);
     }
+    if (nativeFailed) throw new Error("The original Canvas preview could not be completely restored.");
+  }
+  private async awaitRestoration<T>(work: Promise<T>): Promise<T> {
+    let timer: number | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = window.setTimeout(() => reject(new Error("A web card did not finish restoring within 8 seconds.")), RESTORATION_TIMEOUT_MS);
+    });
+    try { return await Promise.race([work, timeout]); }
+    finally { if (timer !== undefined) window.clearTimeout(timer); }
   }
   private restoreNativeTarget(node: Text, target: NativeTarget): void {
     target.unsubscribe?.();
