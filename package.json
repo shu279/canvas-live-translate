@@ -1,0 +1,22 @@
+{
+  "name": "canvas-live-translate",
+  "version": "0.2.2",
+  "private": true,
+  "description": "Display-only Japanese-to-English translation in Obsidian Canvas",
+  "license": "MIT",
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "esbuild": "^0.25.0",
+    "jsdom": "^31.0.0",
+    "obsidian": "^1.14.4",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

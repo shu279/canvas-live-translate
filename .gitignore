@@ -1,0 +1,14 @@
+# Dependencies and local output
+node_modules/
+*.log
+.DS_Store
+release/
+
+# Vault settings, cached note text, and credentials
+.obsidian/
+data.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
